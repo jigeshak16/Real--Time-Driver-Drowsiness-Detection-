@@ -1,0 +1,40 @@
+{
+  "model_name": "AEGIS Vigilance Baseline",
+  "algorithm": "Random Forest",
+  "labels": {
+    "0": "Alert",
+    "5": "Low Vigilant",
+    "10": "Drowsy"
+  },
+  "features": [
+    "EAR",
+    "MAR",
+    "face_width_ratio",
+    "face_height_ratio"
+  ],
+  "training_subjects": [
+    "13",
+    "14",
+    "15",
+    "16",
+    "17",
+    "18",
+    "19",
+    "20",
+    "21",
+    "22",
+    "23",
+    "24",
+    "25",
+    "26",
+    "27",
+    "28",
+    "29",
+    "30"
+  ],
+  "usable_video_count": 54,
+  "frame_count": 4119,
+  "subject_wise_mean_accuracy": 0.21089520529171496,
+  "evaluation": "Leave-one-subject-out cross-validation",
+  "note": "Preliminary research baseline. Not validated for real-world driver safety. Predictions are based on sampled facial frames."
+}

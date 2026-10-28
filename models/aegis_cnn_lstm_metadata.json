@@ -1,0 +1,64 @@
+{
+  "architecture": "MobileNetV2-CNN-LSTM-Temporal-Attention",
+  "sequence_length": 16,
+  "sequences_per_video": 1,
+  "image_height": 96,
+  "image_width": 96,
+  "class_names": [
+    "Alert",
+    "Low Vigilant",
+    "Drowsy"
+  ],
+  "label_mapping": {
+    "0": "Alert",
+    "5": "Low Vigilant",
+    "10": "Drowsy"
+  },
+  "usable_videos": 54,
+  "training_videos": 27,
+  "validation_videos": 12,
+  "test_videos": 15,
+  "training_subject_groups": [
+    "Fold2_15",
+    "Fold2_21",
+    "Fold2_23",
+    "Fold2_24",
+    "additional_17",
+    "additional_18",
+    "additional_28",
+    "additional_29",
+    "additional_30"
+  ],
+  "validation_subject_groups": [
+    "additional_20",
+    "additional_25",
+    "additional_26",
+    "additional_27"
+  ],
+  "test_subject_groups": [
+    "Fold2_13",
+    "Fold2_14",
+    "Fold2_19",
+    "Fold2_22",
+    "additional_16"
+  ],
+  "test_accuracy": 0.4,
+  "test_video_names": [
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\additional\\16\\0.MOV",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\additional\\16\\10.MOV",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\additional\\16\\5.MOV",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part1\\13\\0.mp4",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part1\\13\\10.mp4",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part1\\13\\5.mp4",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part1\\14\\0.mp4",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part1\\14\\10.mp4",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part1\\14\\5.mp4",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part2\\Fold2_part2\\19\\0.MOV",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part2\\Fold2_part2\\19\\10.MOV",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part2\\Fold2_part2\\19\\5.MOV",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part2\\Fold2_part2\\22\\0.MOV",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part2\\Fold2_part2\\22\\10.MOV",
+    "C:\\Users\\Jigesha\\OneDrive\\Desktop\\agentic_driver_safety\\dataset_sample\\Fold2_part2\\Fold2_part2\\22\\5.MOV"
+  ],
+  "note": "Preliminary subject-wise holdout results on a small dataset. Not a clinical or deployment reliability claim."
+}

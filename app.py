@@ -1,12 +1,12 @@
-
+import tensorflow as tf
 import cv2
 import json
-import joblib
 import sqlite3
 import tempfile
 import numpy as np
 import mediapipe as mp
 import streamlit as st
+import pandas as pd
 
 from pathlib import Path
 from streamlit_webrtc import webrtc_streamer
@@ -17,7 +17,7 @@ from agents.alert_agent import AlertAgent
 
 
 # ==========================================================
-# PAGE CONFIGURATION
+# CONFIGURATION
 # ==========================================================
 
 st.set_page_config(
@@ -29,21 +29,13 @@ st.set_page_config(
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "aegis_incidents.db"
-MODEL_PATH = BASE_DIR / "models" / "aegis_vigilance_model.joblib"
-METADATA_PATH = BASE_DIR / "models" / "aegis_vigilance_metadata.json"
+MODEL_PATH = BASE_DIR / "models" / "aegis_cnn_lstm_attention.keras"
+METADATA_PATH = BASE_DIR / "models" / "aegis_cnn_lstm_metadata.json"
 
-SAMPLE_VIDEO = Path.home() / "UTA_RLDD_sample" / "sample_video.mp4"
-
-LABELS = {
-    "0": "Alert",
-    "5": "Low Vigilant",
-    "10": "Drowsy",
-}
-
-CLASS_ORDER = ["0", "5", "10"]
-TEST_FRAMES = 80
-
-mp_face_mesh = mp.solutions.face_mesh
+CLASS_NAMES = ["Alert", "Low Vigilant", "Drowsy"]
+SEQUENCE_LENGTH = 16
+IMAGE_HEIGHT = 96
+IMAGE_WIDTH = 96
 
 
 # ==========================================================
@@ -93,15 +85,69 @@ st.markdown(
 
 
 # ==========================================================
-# LOAD TRAINED MODEL
+# MODEL LOADING — TENSORFLOW LAMBDA FIX
 # ==========================================================
+
+def expose_tensorflow_to_lambda_layers(model):
+    """
+    Expose TensorFlow in the global namespace of deserialized
+    Lambda functions that refer to tf or tensorflow.
+    """
+
+    visited = set()
+
+    def fix_layers(current_model):
+        if id(current_model) in visited:
+            return
+
+        visited.add(id(current_model))
+
+        for layer in getattr(current_model, "layers", []):
+            if isinstance(layer, tf.keras.layers.Lambda):
+                function = getattr(layer, "function", None)
+
+                function_globals = getattr(
+                    function,
+                    "__globals__",
+                    None,
+                )
+
+                if isinstance(function_globals, dict):
+                    function_globals["tf"] = tf
+                    function_globals["tensorflow"] = tf
+
+            # Handle nested models and layer containers.
+            nested_layers = getattr(layer, "layers", None)
+
+            if nested_layers is not None:
+                fix_layers(layer)
+
+    fix_layers(model)
+    return model
+
 
 @st.cache_resource
 def load_classifier():
-    if not MODEL_PATH.exists():
-        return None
+    """Load the trained CNN-LSTM attention model."""
 
-    return joblib.load(MODEL_PATH)
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"CNN-LSTM model not found: {MODEL_PATH}"
+        )
+
+    model = tf.keras.models.load_model(
+        MODEL_PATH,
+        compile=False,
+        safe_mode=False,
+        custom_objects={
+            "tf": tf,
+            "tensorflow": tf,
+        },
+    )
+
+    model = expose_tensorflow_to_lambda_layers(model)
+
+    return model
 
 
 @st.cache_data
@@ -110,8 +156,13 @@ def load_model_metadata():
         return {}
 
     try:
-        with open(METADATA_PATH, "r", encoding="utf-8") as file:
+        with open(
+            METADATA_PATH,
+            "r",
+            encoding="utf-8",
+        ) as file:
             return json.load(file)
+
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -121,8 +172,9 @@ model_error = None
 
 try:
     classifier = load_classifier()
+
 except Exception as error:
-    model_error = str(error)
+    model_error = f"{type(error).__name__}: {error}"
 
 metadata = load_model_metadata()
 
@@ -132,7 +184,10 @@ metadata = load_model_metadata()
 # ==========================================================
 
 def get_connection():
-    connection = sqlite3.connect(DB_PATH, timeout=10)
+    connection = sqlite3.connect(
+        DB_PATH,
+        timeout=10,
+    )
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -160,8 +215,13 @@ def save_incident(monitor, decision):
         connection.execute(
             """
             INSERT INTO incidents (
-                timestamp, status, ear, closed_duration,
-                priority, action, message
+                timestamp,
+                status,
+                ear,
+                closed_duration,
+                priority,
+                action,
+                message
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
@@ -179,9 +239,11 @@ def save_incident(monitor, decision):
 
 def get_incidents():
     with get_connection() as connection:
-        return connection.execute(
+        rows = connection.execute(
             "SELECT * FROM incidents ORDER BY id DESC"
         ).fetchall()
+
+    return [dict(row) for row in rows]
 
 
 initialise_database()
@@ -205,16 +267,21 @@ if "alert_agent" not in st.session_state:
 
 
 # ==========================================================
-# FEATURE EXTRACTION FOR DATASET TESTING
-# Must match train_classifier.py
+# FACIAL MEASUREMENT HELPERS
 # ==========================================================
 
 def distance(a, b):
-    return np.linalg.norm(np.asarray(a) - np.asarray(b))
+    return np.linalg.norm(
+        np.asarray(a) - np.asarray(b)
+    )
 
 
 def extract_frame_features(frame, face_mesh):
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2RGB,
+    )
+
     result = face_mesh.process(rgb)
 
     if not result.multi_face_landmarks:
@@ -231,7 +298,11 @@ def extract_frame_features(frame, face_mesh):
 
     def calculate_ear(indices):
         points = [point(index) for index in indices]
-        horizontal = distance(points[0], points[3])
+
+        horizontal = distance(
+            points[0],
+            points[3],
+        )
 
         if horizontal < 1e-6:
             return np.nan
@@ -241,12 +312,25 @@ def extract_frame_features(frame, face_mesh):
             + distance(points[2], points[4])
         ) / (2.0 * horizontal)
 
-    left_ear = calculate_ear([33, 160, 158, 133, 153, 144])
-    right_ear = calculate_ear([362, 385, 387, 263, 373, 380])
+    left_ear = calculate_ear(
+        [33, 160, 158, 133, 153, 144]
+    )
+
+    right_ear = calculate_ear(
+        [362, 385, 387, 263, 373, 380]
+    )
+
     ear_value = (left_ear + right_ear) / 2.0
 
-    mouth_vertical = distance(point(13), point(14))
-    mouth_horizontal = distance(point(78), point(308))
+    mouth_vertical = distance(
+        point(13),
+        point(14),
+    )
+
+    mouth_horizontal = distance(
+        point(78),
+        point(308),
+    )
 
     mar_value = (
         mouth_vertical / mouth_horizontal
@@ -254,11 +338,21 @@ def extract_frame_features(frame, face_mesh):
         else np.nan
     )
 
-    face_width = distance(point(234), point(454)) / width
-    face_height = distance(point(10), point(152)) / height
+    face_width = (
+        distance(point(234), point(454)) / width
+    )
+
+    face_height = (
+        distance(point(10), point(152)) / height
+    )
 
     features = np.asarray(
-        [ear_value, mar_value, face_width, face_height],
+        [
+            ear_value,
+            mar_value,
+            face_width,
+            face_height,
+        ],
         dtype=float,
     )
 
@@ -268,90 +362,162 @@ def extract_frame_features(frame, face_mesh):
     return features
 
 
+# ==========================================================
+# CNN-LSTM VIDEO ANALYSIS
+# ==========================================================
+
 def analyse_video(video_path, progress_bar=None):
+
     if classifier is None:
-        raise RuntimeError("The trained classifier could not be loaded.")
+        raise RuntimeError(
+            "The CNN-LSTM model is unavailable. "
+            f"Model loading error: {model_error}"
+        )
 
     cap = cv2.VideoCapture(str(video_path))
 
     if not cap.isOpened():
-        raise RuntimeError("OpenCV could not open this video.")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    if total_frames <= 0:
         cap.release()
-        raise RuntimeError("The video contains no readable frames.")
-
-    indices = np.linspace(
-        0,
-        total_frames - 1,
-        min(TEST_FRAMES, total_frames),
-        dtype=int,
-    )
-
-    feature_rows = []
-    frame_numbers = []
+        raise RuntimeError(
+            "OpenCV could not open this video."
+        )
 
     try:
-        with mp_face_mesh.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-        ) as face_mesh:
+        total_frames = int(
+            cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        )
 
-            for position, frame_index in enumerate(indices):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
-                success, frame = cap.read()
+        if total_frames <= 0:
+            raise RuntimeError(
+                "The video contains no readable frames."
+            )
 
-                if success:
-                    features = extract_frame_features(frame, face_mesh)
+        indices = np.linspace(
+            0,
+            total_frames - 1,
+            min(SEQUENCE_LENGTH, total_frames),
+            dtype=int,
+        )
 
-                    if features is not None:
-                        feature_rows.append(features)
-                        frame_numbers.append(int(frame_index))
+        frames = []
 
-                if progress_bar is not None:
-                    progress_bar.progress(
-                        (position + 1) / len(indices),
-                        text=f"Analysing sample {position + 1}/{len(indices)}",
-                    )
+        for position, frame_index in enumerate(indices):
+
+            cap.set(
+                cv2.CAP_PROP_POS_FRAMES,
+                int(frame_index),
+            )
+
+            success, frame = cap.read()
+
+            if not success:
+                continue
+
+            frame = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB,
+            )
+
+            frame = cv2.resize(
+                frame,
+                (IMAGE_WIDTH, IMAGE_HEIGHT),
+            )
+
+            frames.append(frame)
+
+            if progress_bar is not None:
+                progress_bar.progress(
+                    (position + 1) / len(indices),
+                    text=(
+                        f"Preparing frame "
+                        f"{position + 1}/{len(indices)}"
+                    ),
+                )
 
     finally:
         cap.release()
 
-    if not feature_rows:
+    if not frames:
         raise RuntimeError(
-            "No usable face frames were detected. Try a clearer video "
-            "with the driver's face visible."
+            "No frames could be decoded from this video."
         )
 
-    X_test = np.asarray(feature_rows, dtype=float)
-    predictions = classifier.predict(X_test)
+    # Repeat the last frame if the video is shorter than 16 frames.
+    while len(frames) < SEQUENCE_LENGTH:
+        frames.append(frames[-1].copy())
 
-    results = []
+    sequence = np.asarray(
+        frames[:SEQUENCE_LENGTH],
+        dtype=np.float32,
+    ) / 255.0
 
-    for frame_number, features, prediction in zip(
-        frame_numbers, X_test, predictions
+    model_input = np.expand_dims(
+        sequence,
+        axis=0,
+    )
+
+    # CNN-LSTM inference.
+    try:
+        probabilities = classifier.predict(
+            model_input,
+            verbose=0,
+        )
+
+    except Exception as error:
+        raise RuntimeError(
+            "CNN-LSTM inference failed. "
+            "The saved model's Lambda attention layer may need "
+            "a correction in cnn_lstm_model.py and retraining. "
+            f"Original error: {type(error).__name__}: {error}"
+        ) from error
+
+    probabilities = np.asarray(probabilities)
+
+    if probabilities.ndim == 2:
+        probabilities = probabilities[0]
+
+    if (
+        probabilities.ndim != 1
+        or len(probabilities) != len(CLASS_NAMES)
     ):
-        results.append(
-            {
-                "Frame": frame_number,
-                "Prediction": LABELS.get(str(prediction), str(prediction)),
-                "EAR": round(float(features[0]), 4),
-                "MAR": round(float(features[1]), 4),
-            }
+        raise RuntimeError(
+            "Expected three class scores, but model output "
+            f"shape was {probabilities.shape}."
         )
+
+    predicted_index = int(
+        np.argmax(probabilities)
+    )
+
+    predicted_class = CLASS_NAMES[predicted_index]
+
+    confidence = float(
+        probabilities[predicted_index]
+    )
+
+    results = [
+        {
+            "Video": Path(video_path).name,
+            "Predicted vigilance": predicted_class,
+            "Model confidence (%)": round(
+                confidence * 100,
+                2,
+            ),
+            "Frames in sequence": SEQUENCE_LENGTH,
+        }
+    ]
 
     counts = {
-        LABELS[code]: int(
-            sum(str(prediction) == code for prediction in predictions)
-        )
-        for code in CLASS_ORDER
+        name: int(name == predicted_class)
+        for name in CLASS_NAMES
     }
 
-    return results, counts, len(indices), len(frame_numbers)
+    return (
+        results,
+        counts,
+        len(frames),
+        SEQUENCE_LENGTH,
+    )
 
 
 # ==========================================================
@@ -359,6 +525,7 @@ def analyse_video(video_path, progress_bar=None):
 # ==========================================================
 
 with st.sidebar:
+
     st.markdown("# ◈ AEGIS")
     st.caption("AGENTIC DRIVER SAFETY")
     st.divider()
@@ -376,25 +543,27 @@ with st.sidebar:
     )
 
     st.divider()
+
     st.caption("LOCAL PROOF OF CONCEPT")
-    st.caption("Camera processing runs locally.")
     st.caption("Alarm: maximum 6 seconds")
 
     if classifier is not None:
-        st.success("Dataset classifier loaded")
+        st.success("CNN-LSTM model loaded")
     else:
-        st.warning("Dataset classifier unavailable")
+        st.error("CNN-LSTM model unavailable")
 
 
 # ==========================================================
-# HEADER
+# MAIN HEADER
 # ==========================================================
 
 st.markdown("## ◈ AEGIS")
+
 st.caption(
     "Intelligent Driver Monitoring · "
     "Computer Vision · Agentic Safety Workflow"
 )
+
 st.divider()
 
 
@@ -405,23 +574,39 @@ st.divider()
 if page == "Overview":
 
     st.subheader("Safety Operations")
+
     incidents = get_incidents()
 
     sustained_events = sum(
-        1 for item in incidents
+        1
+        for item in incidents
         if item["status"] == "SUSTAINED_EYE_CLOSURE"
     )
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Recorded incidents", len(incidents))
-    col2.metric("Prolonged-closure events", sustained_events)
-    col3.metric("Agent modules", "3")
+
+    col1.metric(
+        "Recorded incidents",
+        len(incidents),
+    )
+
+    col2.metric(
+        "Prolonged-closure events",
+        sustained_events,
+    )
+
+    col3.metric(
+        "Agent modules",
+        "3",
+    )
 
     st.caption(
-        "Prolonged eye closure is an observation, not proof of drowsiness."
+        "Prolonged eye closure is an observation, "
+        "not proof of drowsiness."
     )
 
     st.divider()
+
     st.subheader("System Architecture")
 
     col1, col2 = st.columns(2)
@@ -429,29 +614,39 @@ if page == "Overview":
     with col1:
         with st.container(border=True):
             st.markdown("#### Vision Engine")
-            st.write("Webcam → Facial landmarks → EAR / MAR")
-            st.success("Available when camera monitoring is active.")
+            st.write(
+                "Webcam → Facial landmarks → EAR / MAR"
+            )
+            st.success(
+                "Available when camera monitoring is active."
+            )
 
     with col2:
         with st.container(border=True):
             st.markdown("#### Agent Workflow")
             st.write("Monitor → Decision → Alert")
-            st.success("Monitor, decision, and alert modules are connected.")
+            st.success(
+                "Monitor, decision, and alert modules are connected."
+            )
 
     st.divider()
+
     st.subheader("Dataset Classifier")
 
     if classifier is not None:
-        st.success("The trained experimental classifier is loaded.")
-        st.caption(
-            "Open Dataset Testing to analyse a prerecorded video."
+        st.success(
+            "The trained CNN-LSTM model is loaded."
         )
     else:
         st.warning(
-            "No trained model is available. Run train_classifier.py first."
+            "The CNN-LSTM model is unavailable."
         )
 
+        if model_error:
+            st.code(model_error)
+
     st.divider()
+
     st.subheader("Recent Incidents")
 
     if incidents:
@@ -468,138 +663,215 @@ if page == "Overview":
             use_container_width=True,
             hide_index=True,
         )
+
     else:
-        st.info("No incidents recorded yet. Start Live Monitoring.")
+        st.info(
+            "No incidents recorded yet. Start Live Monitoring."
+        )
 
 
 # ==========================================================
 # LIVE MONITORING
-# Existing webcam alarm logic preserved
 # ==========================================================
 
 elif page == "Live Monitoring":
 
     st.subheader("Live Driver Monitoring")
-    st.caption("Live webcam input with agent results.")
+
+    st.caption(
+        "Live webcam input with agent results."
+    )
 
     st.warning(
         "This prototype detects possible prolonged eye closure. "
-        "It is not a validated drowsiness classifier or vehicle safety system."
+        "It is not a validated drowsiness classifier or "
+        "vehicle safety system."
     )
 
     camera_context = webrtc_streamer(
         key="aegis_driver_camera",
         video_processor_factory=DriverProcessor,
-        media_stream_constraints={"video": True, "audio": False},
+        media_stream_constraints={
+            "video": True,
+            "audio": False,
+        },
         async_processing=True,
     )
 
     st.divider()
+
     st.subheader("Live Agent Results")
 
-    @st.fragment(run_every=1)
+    @st.fragment(run_every=2)
     def live_agent_panel():
 
-        processor = getattr(camera_context, "video_processor", None)
+        processor = getattr(
+            camera_context,
+            "video_processor",
+            None,
+        )
 
         if processor is None:
-            st.info("Start the camera to see live agent results.")
+            st.info(
+                "Start the camera to see live agent results."
+            )
             return
 
-        monitor = getattr(processor, "latest_event", None)
+        monitor = getattr(
+            processor,
+            "latest_event",
+            None,
+        )
 
         if not monitor:
-            st.info("Waiting for the first webcam observation...")
+            st.info(
+                "Waiting for the first webcam observation..."
+            )
             return
 
         decision = DecisionAgent().decide(monitor)
 
-        status = monitor.get("status", "UNABLE_TO_ASSESS")
-        action = decision.get("action", "WAIT")
-        priority = decision.get("priority", "LOW")
+        status = monitor.get(
+            "status",
+            "UNABLE_TO_ASSESS",
+        )
+
+        action = decision.get(
+            "action",
+            "WAIT",
+        )
+
+        priority = decision.get(
+            "priority",
+            "LOW",
+        )
+
         event_id = monitor.get("event_id")
 
         alert_agent = st.session_state.alert_agent
         alert_result = None
 
-        # Stop the alarm when sustained eye closure is no longer reported.
         if status != "SUSTAINED_EYE_CLOSURE":
+
             if alert_agent.is_active():
                 alert_agent.stop()
 
-        # Trigger the alarm once for each new closure event.
         elif (
             event_id is not None
-            and event_id != st.session_state.last_alerted_event_id
+            and event_id
+            != st.session_state.last_alerted_event_id
         ):
+
             st.session_state.last_alerted_event_id = event_id
+
             alert_result = alert_agent.execute(
                 {"alert_required": True}
             )
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("Monitor status", status.replace("_", " ").title())
-        col2.metric("Decision action", action.replace("_", " "))
-        col3.metric("Priority", priority)
+
+        col1.metric(
+            "Monitor status",
+            status.replace("_", " ").title(),
+        )
+
+        col2.metric(
+            "Decision action",
+            action.replace("_", " "),
+        )
+
+        col3.metric(
+            "Priority",
+            priority,
+        )
 
         ear = monitor.get("ear")
-        duration = monitor.get("closed_duration", 0.0) or 0.0
+
+        duration = (
+            monitor.get("closed_duration", 0.0)
+            or 0.0
+        )
 
         col1, col2 = st.columns(2)
+
         col1.metric(
             "Eye Aspect Ratio (EAR)",
             f"{ear:.3f}" if ear is not None else "N/A",
         )
-        col2.metric("Eye-closure duration", f"{duration:.1f} s")
 
-        st.write("**Monitor Agent:**", monitor.get("message", ""))
-        st.write("**Decision Agent:**", decision.get("reason", ""))
+        col2.metric(
+            "Eye-closure duration",
+            f"{duration:.1f} s",
+        )
+
+        st.write(
+            "**Monitor Agent:**",
+            monitor.get("message", ""),
+        )
+
+        st.write(
+            "**Decision Agent:**",
+            decision.get("reason", ""),
+        )
 
         if status == "SUSTAINED_EYE_CLOSURE":
+
             if (
                 event_id is not None
-                and event_id != st.session_state.last_logged_event_id
+                and event_id
+                != st.session_state.last_logged_event_id
             ):
-                save_incident(monitor, decision)
+
+                save_incident(
+                    monitor,
+                    decision,
+                )
+
                 st.session_state.last_logged_event_id = event_id
 
             st.error(
                 "Possible prolonged eye closure detected. "
                 "Further assessment is required."
             )
+
         else:
-            st.info("No sustained eye-closure event currently detected.")
+            st.info(
+                "No sustained eye-closure event currently detected."
+            )
 
         if alert_agent.is_active():
+
             st.error("🔊 WARNING ALARM ACTIVE")
 
-            if st.button("Stop alarm now", key="stop_aegis_alarm"):
+            if st.button(
+                "Stop alarm now",
+                key="stop_aegis_alarm",
+            ):
                 alert_agent.stop()
                 st.success("Alarm stopped.")
-        elif status == "SUSTAINED_EYE_CLOSURE":
-            st.warning(
-                "Sustained eye closure detected. Check the alert message below."
-            )
+
         else:
-            st.caption(
-                "Alarm is on standby. Normal blinks should not trigger it."
-            )
+            st.caption("Alarm is on standby.")
 
         if alert_result is not None:
-            st.caption(alert_result.get("message", ""))
+
+            if isinstance(alert_result, dict):
+                st.caption(
+                    alert_result.get("message", "")
+                )
+            else:
+                st.caption(str(alert_result))
 
         st.caption(
             "The alarm is designed to stop when the eyes reopen "
             "or after its maximum duration of 6 seconds."
         )
-        st.caption("Existing historical records are not deleted.")
 
     live_agent_panel()
 
 
 # ==========================================================
 # DATASET TESTING
-# Uses the saved trained classifier
 # ==========================================================
 
 elif page == "Dataset Testing":
@@ -607,15 +879,25 @@ elif page == "Dataset Testing":
     st.subheader("UTA-RLDD Dataset Testing")
 
     st.caption(
-        "Upload a prerecorded video to inspect sampled frames "
-        "and run the experimental trained classifier."
+        "Upload a prerecorded video and run the trained CNN-LSTM model."
     )
 
     st.warning(
-        "The classifier achieved low subject-wise accuracy in the "
-        "current evaluation. Predictions are experimental and must not "
-        "be used as real-world driving safety decisions."
+        "Predictions are experimental and must not be used "
+        "as real-world driving safety decisions."
     )
+
+    if model_error:
+        st.error("CNN-LSTM model loading error:")
+        st.code(model_error)
+
+    accuracy = metadata.get("test_accuracy")
+
+    if accuracy is not None:
+        st.caption(
+            "Saved held-out test accuracy: "
+            f"{float(accuracy) * 100:.2f}%"
+        )
 
     uploaded_video = st.file_uploader(
         "Upload a dataset video",
@@ -623,139 +905,193 @@ elif page == "Dataset Testing":
         key="dataset_video_upload",
     )
 
-    video_path = None
-    is_temporary = False
+    if uploaded_video is None:
 
-    if uploaded_video is not None:
-        suffix = Path(uploaded_video.name).suffix or ".mp4"
+        st.info("Upload a video to begin.")
+
+    else:
+
+        suffix = (
+            Path(uploaded_video.name).suffix
+            or ".mp4"
+        )
+
+        video_path = None
 
         try:
+
             with tempfile.NamedTemporaryFile(
                 delete=False,
                 suffix=suffix,
             ) as temp_file:
-                temp_file.write(uploaded_video.getbuffer())
+
+                temp_file.write(
+                    uploaded_video.getbuffer()
+                )
+
                 video_path = Path(temp_file.name)
-                is_temporary = True
 
-        except OSError as error:
-            st.error(f"Could not prepare uploaded video: {error}")
+            st.markdown("### Video Preview")
 
-    elif SAMPLE_VIDEO.exists():
-        video_path = SAMPLE_VIDEO
+            st.video(
+                uploaded_video.getvalue()
+            )
 
-    if video_path is None:
-        st.info(
-            "Upload a video to begin. The default sample video "
-            "was not found."
-        )
-        st.caption(f"Default video location: {SAMPLE_VIDEO}")
-
-    else:
-        try:
-            cap = cv2.VideoCapture(str(video_path))
+            cap = cv2.VideoCapture(
+                str(video_path)
+            )
 
             if not cap.isOpened():
-                st.error("OpenCV could not open this video.")
-            else:
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                duration = frame_count / fps if fps > 0 else 0
 
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Total frames", f"{frame_count:,}")
-                col2.metric(
-                    "Frame rate",
-                    f"{fps:.2f} FPS" if fps > 0 else "Unknown",
+                st.error(
+                    "OpenCV could not open this video."
                 )
-                col3.metric("Duration", f"{duration / 60:.1f} min")
-                col4.metric("Resolution", f"{width} × {height}")
+
+            else:
+
+                fps = cap.get(
+                    cv2.CAP_PROP_FPS
+                )
+
+                frame_count = int(
+                    cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                )
+
+                width = int(
+                    cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                )
+
+                height = int(
+                    cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                )
 
                 cap.release()
 
-                st.markdown("### Video Preview")
-                st.video(str(video_path))
+                duration = (
+                    frame_count / fps
+                    if fps > 0
+                    else 0
+                )
 
-                st.divider()
-                st.markdown("### Frame Inspection")
+                col1, col2, col3, col4 = st.columns(4)
+
+                col1.metric(
+                    "Total frames",
+                    f"{frame_count:,}",
+                )
+
+                col2.metric(
+                    "Frame rate",
+                    f"{fps:.2f} FPS"
+                    if fps > 0
+                    else "Unknown",
+                )
+
+                col3.metric(
+                    "Duration",
+                    f"{duration:.1f} seconds",
+                )
+
+                col4.metric(
+                    "Resolution",
+                    f"{width} × {height}",
+                )
 
                 if frame_count > 0:
+
                     frame_index = st.slider(
-                        "Select a frame",
-                        min_value=0,
-                        max_value=frame_count - 1,
-                        value=0,
+                        "Inspect a frame",
+                        0,
+                        frame_count - 1,
+                        0,
                         key="dataset_frame_index",
                     )
 
-                    preview_cap = cv2.VideoCapture(str(video_path))
+                    preview_cap = cv2.VideoCapture(
+                        str(video_path)
+                    )
+
                     preview_cap.set(
                         cv2.CAP_PROP_POS_FRAMES,
                         int(frame_index),
                     )
+
                     success, frame = preview_cap.read()
                     preview_cap.release()
 
                     if success:
                         st.image(
-                            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                            cv2.cvtColor(
+                                frame,
+                                cv2.COLOR_BGR2RGB,
+                            ),
                             caption=f"Frame {frame_index}",
                             use_container_width=True,
                         )
-                    else:
-                        st.error("Could not decode the selected frame.")
 
                 st.divider()
-                st.markdown("### Trained Classifier Results")
+
+                st.markdown("### CNN-LSTM Prediction")
 
                 if classifier is None:
+
                     st.error(
-                        "The trained model could not be loaded. "
-                        "Check the models folder and the displayed error."
-                    )
-                    if model_error:
-                        st.code(model_error)
-                else:
-                    st.caption(
-                        "The model samples up to 80 frames evenly across "
-                        "the video and predicts each detected face frame."
+                        "The model is not available. "
+                        "Fix the model-loading error before "
+                        "running inference."
                     )
 
-                    if st.button(
-                        "Analyse video with trained model",
-                        type="primary",
-                        key="analyse_dataset_video",
-                    ):
-                        progress = st.progress(
-                            0.0,
-                            text="Preparing video analysis...",
+                elif st.button(
+                    "Analyse video with trained model",
+                    type="primary",
+                    key="analyse_dataset_video",
+                ):
+
+                    progress = st.progress(
+                        0.0,
+                        text="Preparing video analysis...",
+                    )
+
+                    try:
+
+                        (
+                            results,
+                            counts,
+                            sampled,
+                            detected,
+                        ) = analyse_video(
+                            video_path,
+                            progress,
                         )
 
-                        try:
-                            results, counts, sampled, detected = analyse_video(
-                                video_path,
-                                progress,
-                            )
+                        st.session_state.dataset_results = results
+                        st.session_state.dataset_counts = counts
+                        st.session_state.dataset_sampled = sampled
+                        st.session_state.dataset_detected = detected
+                        st.session_state.dataset_filename = (
+                            uploaded_video.name
+                        )
 
-                            progress.empty()
+                        progress.progress(
+                            1.0,
+                            text="Analysis complete.",
+                        )
 
-                            st.session_state.dataset_results = results
-                            st.session_state.dataset_counts = counts
-                            st.session_state.dataset_sampled = sampled
-                            st.session_state.dataset_detected = detected
-                            st.session_state.dataset_filename = (
-                                uploaded_video.name
-                                if uploaded_video is not None
-                                else video_path.name
-                            )
+                        st.success(
+                            "Video analysis completed."
+                        )
 
-                        except Exception as error:
-                            progress.empty()
-                            st.error(f"Video analysis failed: {error}")
+                    except Exception as error:
+
+                        st.error(
+                            f"Video analysis failed: {error}"
+                        )
+
+                    finally:
+                        progress.empty()
 
                 if "dataset_results" in st.session_state:
+
                     results = st.session_state.dataset_results
                     counts = st.session_state.dataset_counts
                     sampled = st.session_state.dataset_sampled
@@ -764,66 +1100,58 @@ elif page == "Dataset Testing":
                     st.markdown("#### Prediction Summary")
 
                     col1, col2, col3 = st.columns(3)
-                    col1.metric("Frames sampled", sampled)
-                    col2.metric("Frames with detected face", detected)
+
+                    col1.metric(
+                        "Frames sampled",
+                        sampled,
+                    )
+
+                    col2.metric(
+                        "Frames in sequence",
+                        detected,
+                    )
+
                     col3.metric(
-                        "Frames analysed",
+                        "Video predictions",
                         len(results),
                     )
 
-                    prediction_total = len(results)
+                    st.dataframe(
+                        results,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-                    if prediction_total:
-                        for class_name in [
-                            "Alert",
-                            "Low Vigilant",
-                            "Drowsy",
-                        ]:
-                            count = counts[class_name]
-                            percentage = 100 * count / prediction_total
+                    st.markdown("#### Class Results")
 
-                            st.write(
-                                f"**{class_name}:** {count} frames "
-                                f"({percentage:.1f}%)"
-                            )
-                            st.progress(percentage / 100)
-
-                        most_common = max(counts, key=counts.get)
-
-                        st.info(
-                            f"Most frequent sampled-frame prediction: "
-                            f"**{most_common}**. This is an experimental "
-                            f"summary, not a validated overall vigilance result."
+                    for class_name in CLASS_NAMES:
+                        st.write(
+                            f"**{class_name}:** "
+                            f"{counts[class_name]} prediction(s)"
                         )
 
-                        st.markdown("#### Frame-by-frame Predictions")
+                    csv_data = pd.DataFrame(
+                        results
+                    ).to_csv(
+                        index=False
+                    ).encode("utf-8")
 
-                        st.dataframe(
-                            results,
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+                    st.download_button(
+                        "Download prediction results (CSV)",
+                        data=csv_data,
+                        file_name="aegis_dataset_predictions.csv",
+                        mime="text/csv",
+                    )
 
-                        csv_data = __import__("pandas").DataFrame(
-                            results
-                        ).to_csv(index=False).encode("utf-8")
+        except Exception as error:
 
-                        st.download_button(
-                            "Download prediction results (CSV)",
-                            data=csv_data,
-                            file_name="aegis_dataset_predictions.csv",
-                            mime="text/csv",
-                        )
-
-                    else:
-                        st.warning(
-                            "No face frames were available for prediction."
-                        )
+            st.error(
+                f"Could not process the uploaded video: {error}"
+            )
 
         finally:
-            # The video has already been processed and rendered.
-            # Uploaded files are temporary copies, not source dataset files.
-            if is_temporary and video_path is not None:
+
+            if video_path is not None:
                 try:
                     video_path.unlink(missing_ok=True)
                 except OSError:
@@ -837,7 +1165,10 @@ elif page == "Dataset Testing":
 elif page == "Agent Control Centre":
 
     st.subheader("Agent Control Centre")
-    st.caption("Implemented modules and current integration status.")
+
+    st.caption(
+        "Implemented modules and current integration status."
+    )
 
     agent_details = [
         (
@@ -856,7 +1187,7 @@ elif page == "Agent Control Centre":
             "Agent Orchestrator",
             "agents/orchestrator.py",
             "Coordinates monitoring and decision modules.",
-            "Independently tested; live integration pending",
+            "Integration status depends on your orchestrator code.",
         ),
         (
             "Alert Agent",
@@ -865,9 +1196,9 @@ elif page == "Agent Control Centre":
             "Connected to live monitoring",
         ),
         (
-            "Dataset Classifier",
-            "models/aegis_vigilance_model.joblib",
-            "Experimental Random Forest using four facial measurements.",
+            "CNN-LSTM Video Model",
+            "models/aegis_cnn_lstm_attention.keras",
+            "MobileNetV2 CNN + LSTM + temporal attention.",
             "Loaded" if classifier is not None else "Unavailable",
         ),
         (
@@ -878,8 +1209,15 @@ elif page == "Agent Control Centre":
         ),
     ]
 
-    for name, file_name, description, status_text in agent_details:
+    for (
+        name,
+        file_name,
+        description,
+        status_text,
+    ) in agent_details:
+
         with st.container(border=True):
+
             col1, col2 = st.columns([3, 1])
 
             with col1:
@@ -899,10 +1237,15 @@ elif page == "Agent Control Centre":
 elif page == "Incident History":
 
     st.subheader("Incident History")
+
     incidents = get_incidents()
 
     if incidents:
-        st.metric("Total recorded incidents", len(incidents))
+
+        st.metric(
+            "Total recorded incidents",
+            len(incidents),
+        )
 
         st.dataframe(
             [
@@ -924,6 +1267,7 @@ elif page == "Incident History":
 
         if st.button("Refresh incident history"):
             st.rerun()
+
     else:
         st.info("No incidents recorded yet.")
 
@@ -937,95 +1281,107 @@ elif page == "Model Evaluation":
     st.subheader("Model Evaluation")
 
     if classifier is None:
-        st.error("The trained classifier could not be loaded.")
+
+        st.error(
+            "The CNN-LSTM model could not be loaded."
+        )
 
         if model_error:
             st.code(model_error)
 
         st.info(
-            "Check that models/aegis_vigilance_model.joblib exists "
-            "and run train_classifier.py if needed."
+            "Check models/aegis_cnn_lstm_attention.keras "
+            "and your training script."
         )
 
     else:
-        st.success("Trained Random Forest model loaded successfully.")
+
+        st.success(
+            "CNN-LSTM video model loaded successfully."
+        )
 
         col1, col2, col3 = st.columns(3)
 
-        col1.metric("Algorithm", "Random Forest")
-        col2.metric("Input features", "4")
-        col3.metric("Classes", "3")
-
-        accuracy = metadata.get(
-            "subject_wise_mean_accuracy",
-            metadata.get("mean_subject_wise_accuracy"),
+        col1.metric(
+            "Architecture",
+            "CNN + LSTM",
         )
+
+        col2.metric(
+            "Input sequence",
+            "16 frames",
+        )
+
+        col3.metric(
+            "Classes",
+            "3",
+        )
+
+        accuracy = metadata.get("test_accuracy")
 
         if accuracy is not None:
             st.metric(
-                "Mean subject-wise accuracy",
+                "Held-out test accuracy",
                 f"{float(accuracy) * 100:.2f}%",
             )
 
         st.markdown("### Training Details")
 
         st.write(
-            "**Evaluation method:** Leave-one-subject-out cross-validation"
+            "**Architecture:** MobileNetV2 CNN + LSTM + temporal attention."
         )
 
         st.write(
-            "**Features:** Eye Aspect Ratio (EAR), Mouth Aspect Ratio (MAR), "
-            "face-width ratio, and face-height ratio."
+            "**Input:** 16 RGB frames resized to 96 × 96 pixels."
         )
 
-        subjects = metadata.get("training_subjects", [])
-        if subjects:
-            st.write("**Subjects used for final training:**", ", ".join(subjects))
+        st.write(
+            "**Classes:** Alert, Low Vigilant, Drowsy."
+        )
 
-        if metadata.get("usable_video_count") is not None:
-            st.write(
-                "**Usable videos:**",
-                metadata["usable_video_count"],
-            )
-        elif metadata.get("video_count") is not None:
-            st.write("**Videos discovered:**", metadata["video_count"])
+        for key, label in [
+            ("usable_videos", "Usable videos"),
+            ("training_videos", "Training videos"),
+            ("validation_videos", "Validation videos"),
+            ("test_videos", "Test videos"),
+        ]:
 
-        if metadata.get("frame_count") is not None:
-            st.write("**Sampled face frames:**", metadata["frame_count"])
+            if metadata.get(key) is not None:
+                st.write(
+                    f"**{label}:** {metadata[key]}"
+                )
 
         st.markdown("### Evaluation Interpretation")
 
         st.warning(
-            "The latest reported mean subject-wise accuracy is approximately "
-            "26.75%. This is a preliminary result and is too low for dependable "
-            "driver-safety classification."
+            "This model is experimental. Do not use it as "
+            "the sole basis for real-world driving decisions."
         )
 
         st.write(
-            "The model's predictions are based on four facial measurements "
-            "from individual frames. It does not yet model eye-closure "
-            "duration or temporal patterns across a video."
-        )
-
-        st.caption(
-            "The accuracy shown above comes from the saved training metadata. "
-            "Class-wise precision, recall, and F1 scores are not stored in "
-            "that metadata file, so they are not reconstructed here."
+            "The CNN extracts visual features from frames, "
+            "the LSTM models changes across the sequence, "
+            "and temporal attention learns which frames to "
+            "emphasize. Further validation is needed."
         )
 
         st.markdown("### Class Labels")
 
         st.dataframe(
             [
-                {"Label code": "0", "Class": "Alert"},
-                {"Label code": "5", "Class": "Low Vigilant"},
-                {"Label code": "10", "Class": "Drowsy"},
+                {
+                    "Label code": "0",
+                    "Class": "Alert",
+                },
+                {
+                    "Label code": "5",
+                    "Class": "Low Vigilant",
+                },
+                {
+                    "Label code": "10",
+                    "Class": "Drowsy",
+                },
             ],
             use_container_width=True,
             hide_index=True,
-        )
-
-        st.info(
-            "The dataset classifier is separate from the live webcam alarm. "
-            "Its predictions do not control or replace the existing alarm."
         )
